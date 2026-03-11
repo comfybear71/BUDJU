@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { motion, AnimatePresence } from "motion/react";
+import { motion } from "motion/react";
 import {
   FaTimes,
   FaSync,
@@ -51,7 +51,6 @@ const TriggerTradeView = ({
 
   // UI state
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [showConfirm, setShowConfirm] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [showError, setShowError] = useState<string | null>(null);
   const [cancellingId, setCancellingId] = useState<string | null>(null);
@@ -108,35 +107,22 @@ const TriggerTradeView = ({
       const dbPending = traderState?.enrichedOrders || [];
       for (const o of dbPending) addOrder(o);
 
-      // Build a comprehensive set of ALL IDs for filled orders.
-      // Swyftx can return different ID formats (numeric orderId vs UUID orderUuid),
-      // so we include every possible ID to ensure matching works.
-      const filledIds = new Set<string>();
-      for (const o of history) {
-        if (o.swyftxId) filledIds.add(o.swyftxId);
-        if (o.orderId) filledIds.add(o.orderId);
-      }
-
-      // Check if ANY of an order's possible IDs appear in the filled set
-      const isFilled = (o: any): boolean => {
-        const ids = [o.orderId, o.orderUuid, o.id, o.swyftxId].filter(Boolean);
-        return ids.some((id) => filledIds.has(id));
-      };
+      const filledIds = new Set(history.map((o: any) => o.swyftxId || o.orderId));
 
       // Remove filled orders from merged list
-      const activeMerged = merged.filter((o) => !isFilled(o));
+      const activeMerged = merged.filter((o) => !filledIds.has(o.orderId));
 
       // Clean up local orders confirmed by API or filled
       setLocalOrders((prev) => {
         const remaining = prev.filter(
-          (lo) => !seenIds.has(lo.orderId) && !isFilled(lo)
+          (lo) => !seenIds.has(lo.orderId) && !filledIds.has(lo.orderId)
         );
         return remaining;
       });
 
       // Clean up filled orders from MongoDB too
       if (isAdmin && walletAddress && dbPending.length > 0) {
-        const dbRemaining = dbPending.filter((o: any) => !isFilled(o));
+        const dbRemaining = dbPending.filter((o: any) => !filledIds.has(o.orderId));
         if (dbRemaining.length < dbPending.length) {
           saveTraderState(walletAddress, { pendingOrders: dbRemaining, enrichedOrders: dbRemaining })
             .catch(() => {});
@@ -146,7 +132,7 @@ const TriggerTradeView = ({
       setOrders((prevOrders) => {
         // Keep in-memory local orders not yet confirmed
         const stillLocal = (prevOrders || []).filter(
-          (o: any) => o._local && !seenIds.has(o.orderId) && !isFilled(o)
+          (o: any) => o._local && !seenIds.has(o.orderId) && !filledIds.has(o.orderId)
         );
         return [...activeMerged, ...stillLocal];
       });
@@ -175,12 +161,6 @@ const TriggerTradeView = ({
   const availableUsdc = usdcBalance;
   const holdingAsset = assets.find((a) => a.code === selectedCoin);
   const holdingValue = holdingAsset ? holdingAsset.balance * currentPrice : 0;
-  // Swyftx AUD rate per coin — derived from Swyftx's own portfolio valuation
-  // Used by placeTrade to calculate the AUD trigger from Swyftx's own rate
-  // (more accurate than CoinGecko-derived AUD conversion)
-  const swyftxAudRate = holdingAsset && holdingAsset.balance > 0
-    ? holdingAsset.audValue / holdingAsset.balance
-    : 0;
   const maxAmount = mode === "buy" ? availableUsdc : holdingValue;
   const tradeAmount = maxAmount * (amountPct / 100);
 
@@ -220,7 +200,6 @@ const TriggerTradeView = ({
         orderType: "limit",
         triggerPrice,
         currentPrice,
-        swyftxAudRate,
       });
 
       if (result.success) {
@@ -242,7 +221,7 @@ const TriggerTradeView = ({
           trigger: triggerPrice,
           amount: tradeAmount,
           currentPrice,
-          proximity: currentPrice > 0 ? Math.round(Math.abs(currentPrice - triggerPrice) / currentPrice * 10000) / 100 : 0,
+          proximity: Math.round(Math.abs(currentPrice - triggerPrice) / currentPrice * 10000) / 100,
           created: new Date().toISOString(),
           _local: true,
         };
@@ -265,8 +244,7 @@ const TriggerTradeView = ({
           setTimeout(() => loadOrders(), delay);
         }
       } else {
-        const errMsg = result.error || "Order failed";
-        setShowError(typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg));
+        setShowError(result.error || "Order failed");
         setTimeout(() => setShowError(null), 4000);
       }
     } catch (err: any) {
@@ -553,9 +531,9 @@ const TriggerTradeView = ({
                 )}
               </div>
 
-              {/* Confirm button — opens confirmation modal */}
+              {/* Confirm button */}
               <button
-                onClick={() => setShowConfirm(true)}
+                onClick={handleConfirm}
                 disabled={amountPct === 0 || isSubmitting}
                 className={`w-full py-3.5 rounded-xl text-sm font-bold transition-all ${
                   amountPct === 0
@@ -568,78 +546,9 @@ const TriggerTradeView = ({
                 {isSubmitting ? (
                   <FaSpinner className="animate-spin mx-auto" size={16} />
                 ) : (
-                  `${mode === "buy" ? "Buy" : "Sell"} Trigger`
+                  `Confirm ${mode === "buy" ? "Buy" : "Sell"} Trigger`
                 )}
               </button>
-
-              {/* Confirmation modal */}
-              <AnimatePresence>
-                {showConfirm && (
-                  <motion.div
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50"
-                    onClick={() => setShowConfirm(false)}
-                  >
-                    <motion.div
-                      initial={{ opacity: 0, scale: 0.9 }}
-                      animate={{ opacity: 1, scale: 1 }}
-                      exit={{ opacity: 0, scale: 0.9 }}
-                      className="p-5 rounded-xl border bg-[#0a0a1a] border-white/[0.08] max-w-xs w-full mx-4"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <h3 className="font-bold text-sm mb-3 text-white">
-                        Confirm {mode === "buy" ? "Buy Dip" : "Sell Rise"}
-                      </h3>
-                      <div className="space-y-1.5 text-xs mb-4">
-                        <div className="flex justify-between">
-                          <span className="text-slate-500">Asset</span>
-                          <span className="text-white font-bold">{selectedCoin}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-slate-500">Current Price</span>
-                          <span className="text-slate-300 font-mono">{formatPrice(currentPrice)}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-slate-500">Trigger Price</span>
-                          <span className={`font-bold font-mono ${mode === "buy" ? "text-green-400" : "text-red-400"}`}>
-                            {formatPrice(triggerPrice)} ({offsetPct > 0 ? "+" : ""}{offsetPct}%)
-                          </span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-slate-500">Amount</span>
-                          <span className="text-white font-bold font-mono">{formatPrice(tradeAmount)}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-slate-500">Type</span>
-                          <span className={`font-bold ${mode === "buy" ? "text-green-400" : "text-red-400"}`}>
-                            {mode === "buy"
-                              ? triggerPrice < currentPrice ? "LIMIT BUY" : "STOP BUY"
-                              : triggerPrice > currentPrice ? "LIMIT SELL" : "STOP SELL"}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => setShowConfirm(false)}
-                          className="flex-1 py-2.5 rounded-lg text-xs font-bold bg-white/10 text-white"
-                        >
-                          Cancel
-                        </button>
-                        <button
-                          onClick={() => { setShowConfirm(false); handleConfirm(); }}
-                          className={`flex-1 py-2.5 rounded-lg text-xs font-bold text-white ${
-                            mode === "buy" ? "bg-green-500" : "bg-red-500"
-                          }`}
-                        >
-                          Confirm
-                        </button>
-                      </div>
-                    </motion.div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
 
               {/* Success */}
               {showSuccess && (

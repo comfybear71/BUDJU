@@ -242,12 +242,8 @@ const Trade = () => {
     // Load state from server and potentially resume monitoring
     autoTrader.loadFromServer();
 
-    // Don't destroy autoTrader on unmount — monitoring must continue
-    // even when the user navigates away from the Trading page.
-    // Only detach UI callbacks so we don't update unmounted components.
     return () => {
-      autoTrader.setOnStateChange(() => {});
-      autoTrader.setLogger(() => {});
+      destroyAutoTrader();
     };
   }, [isAdmin, walletAddress, autoTrader]);
 
