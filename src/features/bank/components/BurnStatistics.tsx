@@ -6,12 +6,7 @@ import { BURN_ADDRESS } from "@constants/addresses";
 import { TOKEN_INFO } from "@constants/config";
 import CopyToClipboard from "@components/common/CopyToClipboard";
 import { animateCounter } from "@/lib/utils/animation";
-import {
-  fetchBurnEvents,
-  fetchHeliusTokenMetrics,
-  TOKEN_ADDRESS,
-  BURN_ADDRESS as SERVICE_BURN_ADDRESS,
-} from "@lib/utils/tokenService";
+import { fetchBurnEvents } from "@lib/utils/tokenService";
 import { useTheme } from "@/context/ThemeContext";
 
 gsap.registerPlugin(ScrollTrigger);
@@ -35,9 +30,6 @@ const BurnStatistics = () => {
   
 
   const [burnEvents, setBurnEvents] = useState<BurnEvent[]>([]);
-  const [totalBurned, setTotalBurned] = useState(0);
-  const [percentageBurned, setPercentageBurned] = useState(0);
-  const [totalValue, setTotalValue] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -50,30 +42,11 @@ const BurnStatistics = () => {
         setTimeout(() => reject(new Error("Request timed out")), 15000);
       });
 
-      // Fetch burn events AND on-chain metrics in parallel
-      const dataPromise = Promise.all([
-        fetchBurnEvents(),
-        fetchHeliusTokenMetrics(TOKEN_ADDRESS, SERVICE_BURN_ADDRESS),
-      ]);
-      const [events, metrics] = (await Promise.race([
-        dataPromise,
+      const eventsPromise = fetchBurnEvents();
+      const events = (await Promise.race([
+        eventsPromise,
         timeoutPromise,
-      ])) as [BurnEvent[], { burned: number; price: number }];
-
-      // Calculate total burned from the actual burn events (the amounts shown in the table).
-      // Use the higher of: metrics.burned and the direct sum of events,
-      // ensuring the total always reflects cumulative burns even if tokens
-      // have been moved out of the burn wallet.
-      const eventsTotal = events.reduce((sum: number, e: BurnEvent) => sum + (e.amount || 0), 0);
-      const burned = Math.max(metrics.burned, eventsTotal);
-      const price = metrics.price;
-      const percentage = TOKEN_INFO.TOTAL_SUPPLY > 0
-        ? (burned / TOKEN_INFO.TOTAL_SUPPLY) * 100
-        : 0;
-
-      setTotalBurned(burned);
-      setPercentageBurned(percentage);
-      setTotalValue(burned * price);
+      ])) as BurnEvent[];
 
       if (!events || events.length === 0) {
         console.log("No burn events found.");
@@ -102,6 +75,15 @@ const BurnStatistics = () => {
       clearInterval(interval);
     };
   }, []);
+
+  
+
+  const totalBurned = burnEvents.reduce((sum, event) => sum + event.amount, 0);
+  const totalValue = burnEvents.reduce((sum, event) => sum + event.value, 0);
+  const percentageBurned =
+    TOKEN_INFO.TOTAL_SUPPLY > 0
+      ? (totalBurned / TOKEN_INFO.TOTAL_SUPPLY) * 100
+      : 0;
 
   useEffect(() => {
     if (
@@ -408,77 +390,50 @@ const BurnStatistics = () => {
                         </td>
                       </tr>
                     ) : (
-                      <>
-                        {burnEvents.map((event, index) => (
-                          <tr
-                            key={index}
-                            className={`${isDarkMode ? "border-b border-gray-800 hover:bg-gray-800/30" : "border-b border-white/20 hover:bg-white/30"} transition-colors`}
-                          >
-                            <td
-                              className={
-                                isDarkMode
-                                  ? "py-3 px-4 text-white"
-                                  : "py-3 px-4 text-white"
-                              }
-                            >
-                              {event.date}
-                            </td>
-                            <td
-                              className={`py-3 px-4 text-right ${isDarkMode ? "text-white" : "text-white"} font-medium`}
-                            >
-                              {event.amount.toLocaleString()} BUDJU
-                            </td>
-                            <td className="py-3 px-4 text-right text-green-400">
-                              ${event.value.toFixed(2)}
-                            </td>
-                            <td className="py-3 px-4">
-                              {event.txHash.startsWith("N/A") ? (
-                                <span
-                                  className={
-                                    isDarkMode ? "text-gray-400" : "text-white/80"
-                                  }
-                                >
-                                  {event.txHash}
-                                </span>
-                              ) : (
-                                <a
-                                  href={`https://solscan.io/tx/${event.txHash}`}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="text-budju-blue hover:underline font-mono text-xs md:text-sm truncate block max-w-[150px] md:max-w-[200px]"
-                                >
-                                  {event.txHash.substring(0, 10)}...
-                                </a>
-                              )}
-                            </td>
-                          </tr>
-                        ))}
-                        {/* Total row */}
+                      burnEvents.map((event, index) => (
                         <tr
-                          className={`${isDarkMode ? "border-t-2 border-gray-700 bg-gray-900/70" : "border-t-2 border-white/40 bg-white/30"}`}
+                          key={index}
+                          className={`${isDarkMode ? "border-b border-gray-800 last:border-b-0 hover:bg-gray-800/30" : "border-b border-white/20 last:border-b-0 hover:bg-white/30"} transition-colors`}
                         >
                           <td
-                            className={`py-3 px-4 font-bold ${isDarkMode ? "text-budju-pink" : "text-white"}`}
+                            className={
+                              isDarkMode
+                                ? "py-3 px-4 text-white"
+                                : "py-3 px-4 text-white"
+                            }
                           >
-                            Total
+                            {event.date}
                           </td>
                           <td
-                            className={`py-3 px-4 text-right font-bold ${isDarkMode ? "text-white" : "text-white"}`}
+                            className={`py-3 px-4 text-right ${isDarkMode ? "text-white" : "text-white"} font-medium`}
                           >
-                            {totalBurned.toLocaleString()} BUDJU
+                            {event.amount.toLocaleString()} BUDJU
                           </td>
-                          <td className="py-3 px-4 text-right font-bold text-green-400">
-                            ${totalValue.toFixed(2)}
+                          <td className="py-3 px-4 text-right text-green-400">
+                            ${event.value.toFixed(2)}
                           </td>
                           <td className="py-3 px-4">
-                            <span
-                              className={`text-xs ${isDarkMode ? "text-gray-500" : "text-white/60"}`}
-                            >
-                              {percentageBurned.toFixed(6)}% of supply
-                            </span>
+                            {event.txHash.startsWith("N/A") ? (
+                              <span
+                                className={
+                                  isDarkMode ? "text-gray-400" : "text-white/80"
+                                }
+                              >
+                                {event.txHash}
+                              </span>
+                            ) : (
+                              <a
+                                href={`https://solscan.io/tx/${event.txHash}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-budju-blue hover:underline font-mono text-xs md:text-sm truncate block max-w-[150px] md:max-w-[200px]"
+                              >
+                                {event.txHash.substring(0, 10)}...
+                              </a>
+                            )}
                           </td>
                         </tr>
-                      </>
+                      ))
                     )}
                   </tbody>
                 </table>

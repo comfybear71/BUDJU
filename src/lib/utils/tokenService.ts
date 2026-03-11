@@ -376,7 +376,7 @@ export async function fetchHeliusTokenMetrics(
   burnAddress: string = BURN_ADDRESS,
 ): Promise<TokenMetrics> {
   try {
-    const [dexResult, supplyResult, holderResult, jupiterResult, geckoResult, jupTokenResult, raydiumResult, bankResult, devResult, burnEventsResult, burnBalanceResult] =
+    const [dexResult, supplyResult, holderResult, jupiterResult, geckoResult, jupTokenResult, raydiumResult, bankResult, devResult, burnEventsResult] =
       await Promise.allSettled([
         fetchDexScreenerData(tokenAddress),        // price + marketCap + volume (free, no key)
         fetchTokenSupply(tokenAddress),             // current on-chain supply
@@ -387,8 +387,7 @@ export async function fetchHeliusTokenMetrics(
         fetchTokenBalance(RAYDIUM_AUTHORITY_V4, tokenAddress),      // Raydium liquidity pool
         fetchTokenBalance(BANK_OF_BUDJU_ADDRESS, tokenAddress),     // Bank of BUDJU balance
         fetchTokenBalance(DEVELOPER_VAULT_ADDRESS, tokenAddress),   // Developer vault (never sold)
-        fetchBurnEvents(burnAddress, tokenAddress),                 // burn transfer events (for history table)
-        fetchTokenBalance(burnAddress, tokenAddress),               // actual burn wallet balance (source of truth)
+        fetchBurnEvents(burnAddress, tokenAddress),                 // burn transfer events
       ]);
 
     const dex = dexResult.status === "fulfilled"
@@ -396,15 +395,9 @@ export async function fetchHeliusTokenMetrics(
       : { price: 0, volume24h: 0, priceChange24h: 0, marketCap: 0, fdv: 0 };
     const currentSupply = supplyResult.status === "fulfilled" ? supplyResult.value : 0;
     const totalSupply = INITIAL_MINT_SUPPLY;
-    // Burned tokens: use the HIGHER of the wallet balance and the sum of burn events.
-    // The wallet balance only shows what's currently sitting in the burn address —
-    // tokens may have been moved out (e.g. to Raydium), so the wallet balance can
-    // be lower than the true total. The event sum tracks all historical transfers
-    // INTO the burn address, which is the real cumulative total.
-    const burnBalance = burnBalanceResult.status === "fulfilled" ? burnBalanceResult.value : 0;
+    // Burned = sum of all transfers TO the burn address (real burn events from blockchain)
     const burnEvts = burnEventsResult.status === "fulfilled" ? burnEventsResult.value : [];
-    const burnEvtsTotal = burnEvts.reduce((sum: number, e: any) => sum + (e.amount || 0), 0);
-    const burned = Math.max(burnBalance, burnEvtsTotal);
+    const burned = burnEvts.reduce((sum: number, e: any) => sum + (e.amount || 0), 0);
     const heliusHolders = holderResult.status === "fulfilled" ? holderResult.value : 0;
     const jupiterPrice = jupiterResult.status === "fulfilled" ? jupiterResult.value : 0;
     const geckoPrice = geckoResult.status === "fulfilled" ? geckoResult.value : 0;
@@ -567,7 +560,6 @@ export async function fetchHistoricalPriceData(
 }
 
 // Fetch burn events — uses the burn TOKEN ACCOUNT for reliable signature lookup
-// Fetches ALL historical burn transactions using pagination for complete history.
 export async function fetchBurnEvents(
   burnAddress: string = BURN_ADDRESS,
   tokenAddress: string = TOKEN_ADDRESS,
@@ -579,8 +571,7 @@ export async function fetchBurnEvents(
   try {
     // Use the burn token account (9NNv...) for signatures — this is the actual
     // SPL token account that receives BUDJU, so all token transfers show up here.
-    // Fetch up to 1000 signatures with pagination to capture full burn history.
-    const signatures = await fetchAllSignatures(BURN_TOKEN_ACCOUNT, 1000);
+    const signatures = await fetchRecentSignatures(BURN_TOKEN_ACCOUNT, 20);
     let burnEvents: BurnEvent[] = [];
     if (signatures.length > 0) {
       burnEvents = await processBurnTransactions(signatures, burnAddress, tokenAddress);
@@ -595,44 +586,26 @@ export async function fetchBurnEvents(
 }
 
 // Helper functions for burn events
-// Fetch ALL signatures for an address using pagination (walks backward through history)
-async function fetchAllSignatures(
+async function fetchRecentSignatures(
   address: string,
-  maxSignatures = 1000,
+  limit = 20,
 ): Promise<any[]> {
-  const allSignatures: any[] = [];
-  let before: string | undefined;
-  const batchSize = 100;
-
   try {
-    while (allSignatures.length < maxSignatures) {
-      const params: Record<string, any> = { limit: Math.min(batchSize, maxSignatures - allSignatures.length) };
-      if (before) params.before = before;
-
-      const response = await fetch(HELIUS_RPC_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "signatures-query",
-          method: "getSignaturesForAddress",
-          params: [address, params],
-        }),
-      });
-      const data = await response.json();
-      const batch = data.result || [];
-      if (batch.length === 0) break;
-
-      allSignatures.push(...batch);
-      before = batch[batch.length - 1].signature;
-
-      // If we got fewer than requested, we've reached the end
-      if (batch.length < batchSize) break;
-    }
-    return allSignatures;
+    const response = await fetch(HELIUS_RPC_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "signatures-query",
+        method: "getSignaturesForAddress",
+        params: [address, { limit }],
+      }),
+    });
+    const data = await response.json();
+    return data.result || [];
   } catch (error) {
     console.error("Error fetching signatures:", error);
-    return allSignatures; // Return whatever we have so far
+    return [];
   }
 }
 
