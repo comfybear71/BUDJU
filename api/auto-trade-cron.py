@@ -252,6 +252,10 @@ def run_auto_trade_check():
     """Core auto-trade logic. Returns a result dict with a log."""
     log = []
 
+    # Emergency kill-switch: set TRADING_ENABLED=false in Vercel env to halt all trades
+    if os.getenv("TRADING_ENABLED", "true").lower() == "false":
+        return {"skipped": True, "reason": "Trading disabled via TRADING_ENABLED env var", "log": log}
+
     if not SWYFTX_API_KEY:
         return {"error": "SWYFTX_API_KEY not set", "log": log}
 
