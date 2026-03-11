@@ -74,16 +74,25 @@ ASSET_CG_IDS = {
 
 # ── HTTP Helper ───────────────────────────────────────────────
 
-def _http_json(url, method="GET", body=None, headers=None):
-    """Simple HTTP JSON request."""
+def _http_json(url, method="GET", body=None, headers=None, retries=0, backoff=2):
+    """Simple HTTP JSON request with optional retry + exponential backoff."""
     hdrs = dict(headers) if headers else {}
     data = json.dumps(body).encode() if body else None
     if data and "Content-Type" not in hdrs:
         hdrs["Content-Type"] = "application/json"
     hdrs.setdefault("User-Agent", "SwyftxTrader/1.0")
-    req = Request(url, data=data, headers=hdrs, method=method)
-    with urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode())
+    last_error = None
+    for attempt in range(1 + retries):
+        try:
+            req = Request(url, data=data, headers=hdrs, method=method)
+            with urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                wait = backoff ** attempt  # 1s, 2s, 4s...
+                time.sleep(wait)
+    raise last_error
 
 # ── Swyftx Token Management ──────────────────────────────────
 
@@ -116,10 +125,10 @@ def _swyftx_headers():
 # ── Data Fetching ─────────────────────────────────────────────
 
 def fetch_prices():
-    """Fetch USD prices from CoinGecko for all tracked assets."""
+    """Fetch USD prices from CoinGecko for all tracked assets (with retry)."""
     ids = ",".join(ASSET_CG_IDS.values())
     url = f"{COINGECKO_URL}?ids={ids}&vs_currencies=usd,aud"
-    data = _http_json(url)
+    data = _http_json(url, retries=2, backoff=2)  # Retry up to 2x with 1s, 2s backoff
 
     prices = {}
     for code, cg_id in ASSET_CG_IDS.items():
