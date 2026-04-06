@@ -69,10 +69,18 @@ export interface UserPosition {
 
 export interface TraderState {
   enrichedOrders: any[];
-  autoTierAssets: Record<string, { name?: string; deviation: number; allocation: number; active?: boolean; coins?: string[] }>;
-  autoTierAssignments: Record<string, string>;
+  autoTierAssets: Record<string, {
+    name?: string;
+    deviation: number;
+    sellDeviation?: number;
+    allocation: number;
+    cooldownHours?: number;
+    active?: boolean;
+    coins?: string[];
+  }>;
+  autoTierAssignments: Record<string, string | number[]>;  // old: "tier1", new: [1,2,3]
   autoBotActive: boolean;
-  autoCooldowns: Record<string, number>;
+  autoCooldowns: Record<string, number>;  // compound keys "BTC:1"
   autoTradeLog: Array<{
     coin: string;
     side: string;
