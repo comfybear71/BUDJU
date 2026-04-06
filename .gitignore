@@ -28,5 +28,9 @@ dist-ssr
 .env
 .vercel
 
+# Python cache
+__pycache__/
+*.pyc
+
 # Reference files
 COMPLETE_CODEBASE.txt
