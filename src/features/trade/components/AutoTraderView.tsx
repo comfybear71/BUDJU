@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { FaTimes, FaArrowUp, FaArrowDown } from "react-icons/fa";
 import { fetchTraderState, ASSET_CONFIG } from "../services/tradeApi";
+import { AutoTrader } from "../services/autoTrader";
 
 interface Props {
   isOpen: boolean;
@@ -44,7 +45,7 @@ const AutoTraderView = ({ isOpen, onClose, prices, changes = {} }: Props) => {
   }, [isOpen]);
 
   // Build monitoring data from tier config + assignments
-  // Uses autoActive.targets for real buy/sell triggers when available
+  // Uses compound keys ("BTC:1", "BTC:2") for targets and cooldowns
   const getMonitoringData = () => {
     if (!state) return [];
     const assignments = state.autoTierAssignments || {};
@@ -54,66 +55,102 @@ const AutoTraderView = ({ isOpen, onClose, prices, changes = {} }: Props) => {
     const liveTargets = autoActive.targets || {};
     const tierActive = autoActive.tierActive || {};
 
-    // Build coin→tierKey map from assignments first
-    const coinTierMap: Record<string, string> = {};
-    for (const [coin, tierKey] of Object.entries(assignments)) {
-      coinTierMap[coin] = tierKey as string;
-    }
-
-    // If assignments is empty, build from tier coins arrays
-    if (Object.keys(coinTierMap).length === 0) {
-      for (const [tierKey, cfg] of Object.entries(tierAssets) as [string, any][]) {
-        const coins = cfg.coins || [];
-        for (const coin of coins) {
-          coinTierMap[coin] = tierKey;
-        }
-      }
-    }
-
-    // If still empty, build from liveTargets (coins being actively monitored)
-    if (Object.keys(coinTierMap).length === 0) {
-      for (const coin of Object.keys(liveTargets)) {
-        coinTierMap[coin] = "tier1"; // fallback tier key
-      }
-    }
-
     const items: any[] = [];
-    for (const [coin, tierKey] of Object.entries(coinTierMap)) {
-      const tier = tierAssets[tierKey] || {};
-      const dev = Number(tier.deviation) || 0;
-      const cp = Number(prices[coin]) || 0;
-      const change = Number(changes[coin]) || 0;
-      const live = liveTargets[coin];
 
-      // Check if this coin's tier is actually active
-      const tierNum = tierKey.replace("tier", "");
-      const isTierActive = !!(tierActive[tierNum] ?? tierActive[tierKey] ?? tier.active);
+    // For each coin, check each tier it's assigned to
+    for (const [coin, tierValue] of Object.entries(assignments)) {
+      // Support both old format ("tier1") and new format ([1,2,3])
+      let tierNums: number[] = [];
+      if (Array.isArray(tierValue)) {
+        tierNums = tierValue as number[];
+      } else {
+        const tierStr = String(tierValue);
+        const num = tierStr.startsWith("tier")
+          ? parseInt(tierStr.replace("tier", ""))
+          : parseInt(tierStr);
+        tierNums = num >= 1 && num <= 3 ? [num] : [1];
+      }
 
-      items.push({
-        coin,
-        tierKey,
-        tierName: tier.name || tierKey.replace("tier", "T"),
-        deviation: dev,
-        currentPrice: cp,
-        // Use real targets from autoActive when available, fall back to calculated
-        buyTrigger: live ? live.buy : (cp > 0 ? cp * (1 - dev / 100) : 0),
-        sellTrigger: live ? live.sell : (cp > 0 ? cp * (1 + dev / 100) : 0),
-        change24h: change,
-        inCooldown: !!(cooldowns[coin] && Date.now() < cooldowns[coin]),
-        hasLiveTarget: !!live,
-        isTierActive,
-      });
+      for (const tierNum of tierNums) {
+        const tierKey = `tier${tierNum}`;
+        const tier = tierAssets[tierKey] || {};
+        const dev = Number(tier.deviation) || 0;
+        const sellDev = Number(tier.sellDeviation) || dev;
+        const cp = Number(prices[coin]) || 0;
+        const change = Number(changes[coin]) || 0;
+
+        // Try compound key first, fall back to plain coin key (old format)
+        const ck = `${coin}:${tierNum}`;
+        const live = liveTargets[ck] || (!ck.includes(":") ? undefined : liveTargets[coin]);
+
+        const isTierActive = !!(tierActive[String(tierNum)] ?? tierActive[tierKey] ?? tier.active);
+
+        // Cooldown: check compound key first, fall back to plain key
+        const cooldownExpiry = cooldowns[ck] || cooldowns[coin] || 0;
+        const inCooldown = typeof cooldownExpiry === "number" && cooldownExpiry > Date.now();
+
+        items.push({
+          coin,
+          tierKey,
+          tierNum,
+          tierName: tier.name || `T${tierNum}`,
+          deviation: dev,
+          sellDeviation: sellDev,
+          currentPrice: cp,
+          buyTrigger: live ? live.buy : (cp > 0 ? cp * (1 - dev / 100) : 0),
+          sellTrigger: live ? live.sell : (cp > 0 ? cp * (1 + sellDev / 100) : 0),
+          change24h: change,
+          inCooldown,
+          hasLiveTarget: !!live,
+          isTierActive,
+        });
+      }
     }
+
+    // Fallback: if no assignments, try building from liveTargets compound keys
+    if (items.length === 0) {
+      for (const key of Object.keys(liveTargets)) {
+        const parsed = AutoTrader.parseCompoundKey(key);
+        if (!parsed) continue;
+        const { coin, tier: tierNum } = parsed;
+        const tierKey = `tier${tierNum}`;
+        const tier = tierAssets[tierKey] || {};
+        const dev = Number(tier.deviation) || 0;
+        const sellDev = Number(tier.sellDeviation) || dev;
+        const cp = Number(prices[coin]) || 0;
+        const change = Number(changes[coin]) || 0;
+        const live = liveTargets[key];
+        const isTierActive = !!(tierActive[String(tierNum)] ?? tier.active);
+
+        items.push({
+          coin,
+          tierKey,
+          tierNum,
+          tierName: tier.name || `T${tierNum}`,
+          deviation: dev,
+          sellDeviation: sellDev,
+          currentPrice: cp,
+          buyTrigger: live ? live.buy : (cp > 0 ? cp * (1 - dev / 100) : 0),
+          sellTrigger: live ? live.sell : (cp > 0 ? cp * (1 + sellDev / 100) : 0),
+          change24h: change,
+          inCooldown: false,
+          hasLiveTarget: !!live,
+          isTierActive,
+        });
+      }
+    }
+
     return items;
   };
 
-  // Group monitoring by tier
+  // Group monitoring by tier number
   const getGrouped = () => {
     const data = getMonitoringData();
     const groups: Record<string, any[]> = {};
     for (const item of data) {
-      if (!groups[item.tierKey]) groups[item.tierKey] = [];
-      groups[item.tierKey].push(item);
+      const key = String(item.tierNum);
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(item);
     }
     return groups;
   };
@@ -216,13 +253,15 @@ const AutoTraderView = ({ isOpen, onClose, prices, changes = {} }: Props) => {
                     <div className="text-[10px] text-slate-500 text-center py-4 mb-3">
                       No coins configured for monitoring yet.
                     </div>
-                  ) : Object.entries(grouped).map(([tierKey, coins]) => {
+                  ) : Object.entries(grouped).map(([tierNumStr, coins]) => {
+                    const tierNum = Number(tierNumStr);
+                    const tierKey = `tier${tierNum}`;
                     const tierCfg = (state?.autoTierAssets || {})[tierKey] || {};
-                    const tierName = tierCfg.name || tierKey.replace("tier", "Tier ");
+                    const tierName = tierCfg.name || `T${tierNum}`;
                     const dev = Number(tierCfg.deviation) || 0;
+                    const sellDev = Number(tierCfg.sellDeviation) || dev;
                     const alloc = Number(tierCfg.allocation) || 0;
-                    // Use the real active state from monitoring data
-                    const tierActive = coins.some((c: any) => c.isTierActive);
+                    const isTierActive = coins.some((c: any) => c.isTierActive);
 
                     return (
                       <div key={tierKey} className="mb-3">
@@ -230,25 +269,23 @@ const AutoTraderView = ({ isOpen, onClose, prices, changes = {} }: Props) => {
                         <div className="flex items-center justify-between mb-2">
                           <div className="flex items-center gap-2">
                             <span className="text-[12px] font-bold" style={{ color: "#a855f7" }}>
-                              {tierKey.replace("tier", "T")} – {tierName}
+                              T{tierNum} – {tierName}
                             </span>
                             <span
                               className="text-[9px] font-bold px-1.5 py-0.5 rounded-lg"
                               style={{
-                                background: tierActive ? "rgba(34,197,94,0.15)" : "rgba(100,116,139,0.15)",
-                                color: tierActive ? "#22c55e" : "#64748b",
+                                background: isTierActive ? "rgba(34,197,94,0.15)" : "rgba(100,116,139,0.15)",
+                                color: isTierActive ? "#22c55e" : "#64748b",
                               }}
                             >
-                              {tierActive ? "ACTIVE" : "OFF"}
+                              {isTierActive ? "ACTIVE" : "OFF"}
                             </span>
                           </div>
-                          <div className="flex gap-3 text-[10px]">
-                            <span className="text-slate-500">
-                              Dev <span className="font-bold text-blue-400">{dev}%</span>
-                            </span>
-                            <span className="text-slate-500">
-                              Alloc <span className="font-bold text-green-400">{alloc}%</span>
-                            </span>
+                          <div className="flex gap-2 text-[10px]">
+                            <span className="font-bold text-green-400">-{dev}%</span>
+                            <span className="text-slate-500">/</span>
+                            <span className="font-bold text-red-400">+{sellDev}%</span>
+                            <span className="font-bold text-blue-400">{alloc}%</span>
                           </div>
                         </div>
 
@@ -375,7 +412,7 @@ const AutoTraderView = ({ isOpen, onClose, prices, changes = {} }: Props) => {
                                       </span>
                                     ) : null}
                                     <span className="text-[9px] font-bold px-1 py-0.5 rounded" style={{ background: "rgba(168,85,247,0.15)", color: "#a855f7" }}>
-                                      {tierKey.replace("tier", "T")}
+                                      T{item.tierNum}
                                     </span>
                                   </div>
                                   <div className="flex items-center gap-1" style={{ color: changeColor }}>
