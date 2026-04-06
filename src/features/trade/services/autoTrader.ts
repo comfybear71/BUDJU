@@ -44,7 +44,9 @@ export interface TierConfig {
 
 export interface TierSettings {
   deviation: number;
+  sellDeviation: number;
   allocation: number;
+  cooldownHours: number;
 }
 
 export interface CoinTargets {
@@ -71,10 +73,10 @@ export interface RecentTrade {
 export interface AutoTraderSnapshot {
   isActive: boolean;
   tierActive: Record<number, boolean>;
-  targets: Record<string, CoinTargets>;
-  cooldowns: Record<string, number>;
+  targets: Record<string, CoinTargets>;  // compound keys "BTC:1", "BTC:2", etc.
+  cooldowns: Record<string, number>;     // compound keys "BTC:1", "BTC:2", etc.
   tierSettings: Record<string, TierSettings>;
-  tierAssignments: Record<string, number>;
+  tierAssignments: Record<string, number[]>;  // coin → array of tier numbers
   tradeLog: TradeLogEntry[];
   recentTrades: Record<string, RecentTrade>;
   isOwner: boolean;
@@ -86,13 +88,12 @@ type LogFn = (message: string, level?: "info" | "success" | "error") => void;
 // ── Constants ────────────────────────────────────────────────
 
 export const TIER_CONFIG: Record<number, TierConfig> = {
-  1: { name: "Blue Chips", color: "#3b82f6", devMin: 1, devMax: 15, allocMin: 1, allocMax: 25 },
-  2: { name: "Alts", color: "#eab308", devMin: 2, devMax: 20, allocMin: 1, allocMax: 20 },
-  3: { name: "Speculative", color: "#f97316", devMin: 3, devMax: 30, allocMin: 1, allocMax: 15 },
+  1: { name: "Normal", color: "#3b82f6", devMin: 1, devMax: 15, allocMin: 1, allocMax: 25 },
+  2: { name: "Big Dip", color: "#eab308", devMin: 2, devMax: 20, allocMin: 1, allocMax: 20 },
+  3: { name: "Crash Buy", color: "#f97316", devMin: 3, devMax: 30, allocMin: 1, allocMax: 25 },
 };
 
-const DEFAULT_T1 = ["BTC", "ETH", "SOL", "BNB", "XRP"];
-const COOLDOWN_HOURS = 24;
+const DEFAULT_TIERS = [1, 2, 3]; // All coins in all tiers by default
 const MIN_USDC_RESERVE = 100;
 const SELL_RATIO = 0.833; // Sell 83% of buy amount (accumulate)
 const CHECK_INTERVAL_MS = 180_000; // 3 minutes
@@ -103,16 +104,31 @@ const HEARTBEAT_STALE_MS = 5 * 60 * 1000; // 5 minutes
 export class AutoTrader {
   // State
   tierActive: Record<number, boolean> = { 1: false, 2: false, 3: false };
-  targets: Record<string, CoinTargets> = {};
-  cooldowns: Record<string, number> = {};
+  targets: Record<string, CoinTargets> = {};   // compound keys "BTC:1"
+  cooldowns: Record<string, number> = {};       // compound keys "BTC:1"
   tierSettings: Record<string, TierSettings> = {
-    tier1: { deviation: 2, allocation: 10 },
-    tier2: { deviation: 5, allocation: 5 },
-    tier3: { deviation: 8, allocation: 3 },
+    tier1: { deviation: 3, sellDeviation: 10, allocation: 5, cooldownHours: 12 },
+    tier2: { deviation: 6, sellDeviation: 12, allocation: 8, cooldownHours: 12 },
+    tier3: { deviation: 10, sellDeviation: 15, allocation: 12, cooldownHours: 24 },
   };
-  tierAssignments: Record<string, number> = {};
+  tierAssignments: Record<string, number[]> = {};  // coin → [1,2,3]
   tradeLog: TradeLogEntry[] = [];
   recentTrades: Record<string, RecentTrade> = {};
+
+  // ── Compound Key Helpers ───────────────────────────────────
+
+  static compoundKey(coin: string, tier: number): string {
+    return `${coin}:${tier}`;
+  }
+
+  static parseCompoundKey(key: string): { coin: string; tier: number } | null {
+    const idx = key.lastIndexOf(":");
+    if (idx === -1) return null;
+    const coin = key.substring(0, idx);
+    const tier = parseInt(key.substring(idx + 1));
+    if (isNaN(tier) || tier < 1 || tier > 3) return null;
+    return { coin, tier };
+  }
 
   // Device ownership — persist deviceId so page refreshes keep the same identity
   private _deviceId = (() => {
@@ -187,39 +203,54 @@ export class AutoTrader {
     const state = await fetchTraderState();
     if (!state) return;
 
-    // Load tier settings
+    // Load tier settings (with migration for sellDeviation/cooldownHours)
     const tierAssets = state.autoTierAssets || {};
     for (const [key, cfg] of Object.entries(tierAssets)) {
       const tierKey = key.startsWith("tier") ? key : `tier${key}`;
       if (this.tierSettings[tierKey]) {
+        const defaults = this.tierSettings[tierKey];
         this.tierSettings[tierKey] = {
-          deviation: Number((cfg as any).deviation) || this.tierSettings[tierKey].deviation,
-          allocation: Number((cfg as any).allocation) || this.tierSettings[tierKey].allocation,
+          deviation: Number((cfg as any).deviation) || defaults.deviation,
+          sellDeviation: Number((cfg as any).sellDeviation) || defaults.sellDeviation,
+          allocation: Number((cfg as any).allocation) || defaults.allocation,
+          cooldownHours: Number((cfg as any).cooldownHours) || defaults.cooldownHours,
         };
       }
     }
 
-    // Load tier assignments (FLUB uses numeric, BUDJU uses "tierN" keys)
+    // Load tier assignments — migrate old single-tier format to multi-tier
     const rawAssignments = state.autoTierAssignments || {};
     this.tierAssignments = {};
     for (const [coin, tier] of Object.entries(rawAssignments)) {
+      // New format: array of tier numbers
+      if (Array.isArray(tier)) {
+        const tiers = (tier as number[]).filter((t) => t >= 1 && t <= 3);
+        if (tiers.length > 0) this.tierAssignments[coin] = tiers;
+        continue;
+      }
+      // Old format: single tier number or "tierN" string → migrate to all 3 tiers
       const tierStr = String(tier);
       const tierNum = tierStr.startsWith("tier")
         ? parseInt(tierStr.replace("tier", ""))
         : parseInt(tierStr);
       if (tierNum >= 1 && tierNum <= 3) {
-        this.tierAssignments[coin] = tierNum;
+        this.tierAssignments[coin] = DEFAULT_TIERS.slice(); // [1,2,3]
       }
     }
 
-    // Load cooldowns
+    // Load cooldowns — migrate old "BTC" keys to compound "BTC:1" keys
     const rawCooldowns = state.autoCooldowns || {};
     this.cooldowns = {};
     const now = Date.now();
-    for (const [coin, expiry] of Object.entries(rawCooldowns)) {
+    for (const [key, expiry] of Object.entries(rawCooldowns)) {
       const expiryTime = Number(expiry);
-      if (expiryTime > now) {
-        this.cooldowns[coin] = expiryTime;
+      if (expiryTime <= now) continue;
+      if (key.includes(":")) {
+        // Already compound key
+        this.cooldowns[key] = expiryTime;
+      } else {
+        // Old format: "BTC" → migrate to "BTC:1" (T1 only, conservative)
+        this.cooldowns[AutoTrader.compoundKey(key, 1)] = expiryTime;
       }
     }
 
@@ -244,19 +275,25 @@ export class AutoTrader {
         this.tierActive[t] = !!(savedTierActive[key] ?? savedTierActive[t]);
       }
 
-      // Restore targets
+      // Restore targets — migrate old "BTC" keys to compound "BTC:1" keys
       const savedTargets = autoActive.targets || {};
       this.targets = {};
-      for (const [code, val] of Object.entries(savedTargets)) {
-        if (typeof val === "object" && val !== null && (val as any).buy && (val as any).sell) {
-          this.targets[code] = val as CoinTargets;
+      for (const [key, val] of Object.entries(savedTargets)) {
+        if (typeof val !== "object" || val === null || !(val as any).buy || !(val as any).sell) continue;
+        if (key.includes(":")) {
+          // Already compound key
+          this.targets[key] = val as CoinTargets;
+        } else {
+          // Old format: "BTC" → migrate to "BTC:1"
+          this.targets[AutoTrader.compoundKey(key, 1)] = val as CoinTargets;
         }
       }
 
-      // Remove coins on cooldown from targets
-      for (const code of Object.keys(this.targets)) {
-        if (this._isOnCooldown(code)) {
-          delete this.targets[code];
+      // Remove compound keys on cooldown from targets
+      for (const key of Object.keys(this.targets)) {
+        const parsed = AutoTrader.parseCompoundKey(key);
+        if (parsed && this._isOnCooldown(parsed.coin, parsed.tier)) {
+          delete this.targets[key];
         }
       }
 
@@ -301,18 +338,12 @@ export class AutoTrader {
 
   getCoinsForTier(tierNum: number): string[] {
     return Object.entries(this.tierAssignments)
-      .filter(([, t]) => t === tierNum)
+      .filter(([, tiers]) => tiers.includes(tierNum))
       .map(([code]) => code);
   }
 
-  getTier(code: string): number {
-    return this.tierAssignments[code] || 0;
-  }
-
-  getSettings(code: string): TierSettings {
-    const tier = this.getTier(code);
-    if (tier >= 1 && tier <= 3) return this.tierSettings[`tier${tier}`];
-    return this.tierSettings.tier2; // fallback
+  getTiersForCoin(code: string): number[] {
+    return this.tierAssignments[code] || [];
   }
 
   getTierSettings(tierNum: number): TierSettings {
@@ -323,50 +354,79 @@ export class AutoTrader {
 
   private _ensureDefaultAssignments() {
     if (Object.keys(this.tierAssignments).length > 0) return;
-    // Assign all known crypto assets from ASSET_CONFIG
+    // Default: all coins in all 3 tiers
     for (const code of Object.keys(ASSET_CONFIG)) {
       if (code === "AUD" || code === "USDC" || code === "USD") continue;
-      this.tierAssignments[code] = DEFAULT_T1.includes(code) ? 1 : 2;
+      this.tierAssignments[code] = DEFAULT_TIERS.slice(); // [1,2,3]
     }
     this._saveTierAssignments();
   }
 
   // ── Coin Assignment ─────────────────────────────────────
 
-  assignCoin(code: string, tierNum: number) {
-    const oldTier = this.tierAssignments[code];
-    this.tierAssignments[code] = tierNum;
+  /** Add a coin to a specific tier */
+  assignCoinToTier(code: string, tierNum: number) {
+    const tiers = this.tierAssignments[code] || [];
+    if (!tiers.includes(tierNum)) {
+      this.tierAssignments[code] = [...tiers, tierNum].sort();
+    }
     this._saveTierAssignments();
 
-    // If old tier was active, remove from targets
-    if (oldTier && this.tierActive[oldTier] && this.targets[code]) {
-      delete this.targets[code];
-    }
-
-    // If new tier is active, add with fresh targets
-    if (this.tierActive[tierNum] && !this._isOnCooldown(code)) {
+    // If tier is active, set targets for this compound key
+    const ck = AutoTrader.compoundKey(code, tierNum);
+    if (this.tierActive[tierNum] && !this._isOnCooldown(code, tierNum)) {
       const price = this._cachedPrices[code];
       if (price) {
-        const dev = this.getTierSettings(tierNum).deviation;
-        this.targets[code] = {
-          buy: price * (1 - dev / 100),
-          sell: price * (1 + dev / 100),
+        const s = this.getTierSettings(tierNum);
+        this.targets[ck] = {
+          buy: price * (1 - s.deviation / 100),
+          sell: price * (1 + s.sellDeviation / 100),
         };
       }
     }
 
     this._saveActiveState();
-    this._log(`${code} → Tier ${tierNum} (${TIER_CONFIG[tierNum].name})`, "info");
+    this._log(`${code} added to T${tierNum} (${TIER_CONFIG[tierNum].name})`, "info");
     this._notifyChange();
   }
 
-  unassignCoin(code: string) {
-    const tier = this.tierAssignments[code];
-    delete this.tierAssignments[code];
-    delete this.targets[code];
+  /** Remove a coin from a specific tier */
+  unassignCoinFromTier(code: string, tierNum: number) {
+    const tiers = this.tierAssignments[code] || [];
+    this.tierAssignments[code] = tiers.filter((t) => t !== tierNum);
+    if (this.tierAssignments[code].length === 0) {
+      delete this.tierAssignments[code];
+    }
+
+    // Remove targets and cooldowns for this compound key
+    const ck = AutoTrader.compoundKey(code, tierNum);
+    delete this.targets[ck];
+    delete this.cooldowns[ck];
+
     this._saveTierAssignments();
     this._saveActiveState();
-    this._log(`${code} removed from Tier ${tier}`, "info");
+    this._log(`${code} removed from T${tierNum}`, "info");
+    this._notifyChange();
+  }
+
+  /** Legacy: assign coin to a single tier (replaces all tier assignments) */
+  assignCoin(code: string, tierNum: number) {
+    this.assignCoinToTier(code, tierNum);
+  }
+
+  /** Legacy: unassign coin from all tiers */
+  unassignCoin(code: string) {
+    const tiers = this.tierAssignments[code] || [];
+    delete this.tierAssignments[code];
+    // Remove all compound keys for this coin
+    for (const t of tiers) {
+      const ck = AutoTrader.compoundKey(code, t);
+      delete this.targets[ck];
+      delete this.cooldowns[ck];
+    }
+    this._saveTierAssignments();
+    this._saveActiveState();
+    this._log(`${code} removed from all tiers`, "info");
     this._notifyChange();
   }
 
@@ -402,16 +462,17 @@ export class AutoTrader {
       return { success: false, error: msg };
     }
 
-    // Set targets for non-cooldown coins
+    // Set targets for non-cooldown coins using compound keys
+    const s = this.getTierSettings(tierNum);
     let added = 0;
     for (const code of tierCoins) {
-      if (!this._isOnCooldown(code)) {
+      const ck = AutoTrader.compoundKey(code, tierNum);
+      if (!this._isOnCooldown(code, tierNum)) {
         const price = this._cachedPrices[code];
         if (price && price > 0) {
-          const dev = this.getTierSettings(tierNum).deviation;
-          this.targets[code] = {
-            buy: price * (1 - dev / 100),
-            sell: price * (1 + dev / 100),
+          this.targets[ck] = {
+            buy: price * (1 - s.deviation / 100),
+            sell: price * (1 + s.sellDeviation / 100),
           };
           added++;
         }
@@ -432,11 +493,11 @@ export class AutoTrader {
     this._log(`Tier ${tierNum} (${cfg.name}) started: monitoring ${added} coin(s)`, "success");
 
     for (const code of tierCoins) {
-      const tgt = this.targets[code];
+      const ck = AutoTrader.compoundKey(code, tierNum);
+      const tgt = this.targets[ck];
       if (tgt) {
-        const s = this.getTierSettings(tierNum);
         this._log(
-          `  ${code} (T${tierNum}): buy < $${tgt.buy.toFixed(2)}, sell > $${tgt.sell.toFixed(2)} (±${s.deviation}%, ${s.allocation}% alloc)`,
+          `  ${code} (T${tierNum}): buy < $${tgt.buy.toFixed(2)} (-${s.deviation}%), sell > $${tgt.sell.toFixed(2)} (+${s.sellDeviation}%), ${s.allocation}% alloc`,
           "info",
         );
       }
@@ -455,9 +516,9 @@ export class AutoTrader {
   stopTier(tierNum: number) {
     this.tierActive[tierNum] = false;
 
-    // Remove targets for this tier's coins
+    // Remove targets for this tier's compound keys
     for (const code of this.getCoinsForTier(tierNum)) {
-      delete this.targets[code];
+      delete this.targets[AutoTrader.compoundKey(code, tierNum)];
     }
 
     this._log(`Tier ${tierNum} (${TIER_CONFIG[tierNum].name}) stopped`, "info");
@@ -482,11 +543,13 @@ export class AutoTrader {
 
   async overrideCooldowns(tierNum: number) {
     const tierCoins = this.getCoinsForTier(tierNum);
+    const s = this.getTierSettings(tierNum);
     let cleared = 0;
 
     for (const code of tierCoins) {
-      if (this.cooldowns[code]) {
-        delete this.cooldowns[code];
+      const ck = AutoTrader.compoundKey(code, tierNum);
+      if (this.cooldowns[ck]) {
+        delete this.cooldowns[ck];
         cleared++;
       }
     }
@@ -498,16 +561,16 @@ export class AutoTrader {
 
     // Add coins that weren't in targets
     for (const code of tierCoins) {
-      if (!this.targets[code]) {
+      const ck = AutoTrader.compoundKey(code, tierNum);
+      if (!this.targets[ck]) {
         const price = this._cachedPrices[code];
         if (price && price > 0) {
-          const dev = this.getTierSettings(tierNum).deviation;
-          this.targets[code] = {
-            buy: price * (1 - dev / 100),
-            sell: price * (1 + dev / 100),
+          this.targets[ck] = {
+            buy: price * (1 - s.deviation / 100),
+            sell: price * (1 + s.sellDeviation / 100),
           };
           this._log(
-            `  Added ${code}: buy < $${this.targets[code].buy.toFixed(2)}, sell > $${this.targets[code].sell.toFixed(2)}`,
+            `  Added ${code}:T${tierNum}: buy < $${this.targets[ck].buy.toFixed(2)}, sell > $${this.targets[ck].sell.toFixed(2)}`,
             "info",
           );
         }
@@ -586,18 +649,20 @@ export class AutoTrader {
 
     let tradeExecuted = false;
 
-    for (const code of Object.keys(this.targets)) {
-      if (this._isOnCooldown(code)) continue;
+    for (const key of Object.keys(this.targets)) {
+      const parsed = AutoTrader.parseCompoundKey(key);
+      if (!parsed) continue;
+      const { coin, tier } = parsed;
 
-      const tier = this.getTier(code);
+      if (this._isOnCooldown(coin, tier)) continue;
       if (!this.tierActive[tier]) continue;
 
-      const settings = this.getSettings(code);
-      const currentPrice = this._cachedPrices[code];
-      const tgt = this.targets[code];
+      const settings = this.getTierSettings(tier);
+      const currentPrice = this._cachedPrices[coin];
+      const tgt = this.targets[key];
 
       if (!tgt || !currentPrice) {
-        this._log(`${code}: no target or price data (price=${currentPrice}, target=${!!tgt})`, "error");
+        this._log(`${coin}:T${tier}: no target or price data (price=${currentPrice}, target=${!!tgt})`, "error");
         continue;
       }
 
@@ -607,24 +672,24 @@ export class AutoTrader {
       // BUY: price dropped below buy target
       if (currentPrice <= tgt.buy) {
         this._log(
-          `${code} hit buy target $${tgt.buy.toFixed(2)} (price: $${currentPrice.toFixed(2)}, ${pctToBuy}% below) — EXECUTING BUY`,
+          `${coin}:T${tier} hit buy target $${tgt.buy.toFixed(2)} (price: $${currentPrice.toFixed(2)}, ${pctToBuy}% below) — EXECUTING BUY`,
           "success",
         );
-        await this._executeBuy(code, currentPrice, settings);
+        await this._executeBuy(key, coin, tier, currentPrice, settings);
         tradeExecuted = true;
       }
       // SELL: price rose above sell target
       else if (currentPrice >= tgt.sell) {
         this._log(
-          `${code} hit sell target $${tgt.sell.toFixed(2)} (price: $${currentPrice.toFixed(2)}, ${pctToSell}% above) — EXECUTING SELL`,
+          `${coin}:T${tier} hit sell target $${tgt.sell.toFixed(2)} (price: $${currentPrice.toFixed(2)}, ${pctToSell}% above) — EXECUTING SELL`,
           "success",
         );
-        await this._executeSell(code, currentPrice, settings);
+        await this._executeSell(key, coin, tier, currentPrice, settings);
         tradeExecuted = true;
       }
       else {
         this._log(
-          `${code}: $${currentPrice.toFixed(2)} — ${pctToBuy}% to buy ($${tgt.buy.toFixed(2)}), ${pctToSell}% to sell ($${tgt.sell.toFixed(2)})`,
+          `${coin}:T${tier}: $${currentPrice.toFixed(2)} — ${pctToBuy}% to buy ($${tgt.buy.toFixed(2)}), ${pctToSell}% to sell ($${tgt.sell.toFixed(2)})`,
           "info",
         );
       }
@@ -639,27 +704,30 @@ export class AutoTrader {
     this._notifyChange();
 
     // Log cooldown status
-    const remaining = Object.keys(this.targets).filter((c) => !this._isOnCooldown(c));
-    const onCooldown = Object.keys(this.targets).length - remaining.length;
-    if (remaining.length === 0 && onCooldown > 0) {
-      this._log(`All ${onCooldown} coins on cooldown — waiting...`, "info");
+    const activeKeys = Object.keys(this.targets).filter((k) => {
+      const p = AutoTrader.parseCompoundKey(k);
+      return p && !this._isOnCooldown(p.coin, p.tier);
+    });
+    const onCooldown = Object.keys(this.targets).length - activeKeys.length;
+    if (activeKeys.length === 0 && onCooldown > 0) {
+      this._log(`All ${onCooldown} coin-tier slots on cooldown — waiting...`, "info");
     }
   }
 
   // ── Trade Execution ─────────────────────────────────────
 
-  private async _executeBuy(code: string, currentPrice: number, settings: TierSettings) {
+  private async _executeBuy(key: string, code: string, tier: number, currentPrice: number, settings: TierSettings) {
     const usdcBalance = this._cachedUsdcBalance;
 
     const tradeAmount = (settings.allocation / 100) * usdcBalance;
     if (usdcBalance - tradeAmount < MIN_USDC_RESERVE) {
-      this._log(`Skipping ${code} buy — USDC $${usdcBalance.toFixed(2)}, trade $${tradeAmount.toFixed(2)}, would break $${MIN_USDC_RESERVE} reserve (alloc ${settings.allocation}%)`, "error");
+      this._log(`Skipping ${code}:T${tier} buy — USDC $${usdcBalance.toFixed(2)}, trade $${tradeAmount.toFixed(2)}, would break $${MIN_USDC_RESERVE} reserve`, "error");
       return;
     }
 
     const quantity = parseFloat((tradeAmount / currentPrice).toFixed(8));
     this._log(
-      `AUTO BUY: ${quantity} ${code} at $${currentPrice.toFixed(2)} ($${tradeAmount.toFixed(2)} USDC)`,
+      `AUTO BUY T${tier}: ${quantity} ${code} at $${currentPrice.toFixed(2)} ($${tradeAmount.toFixed(2)} USDC)`,
       "success",
     );
 
@@ -672,28 +740,28 @@ export class AutoTrader {
       });
 
       if (result.success) {
-        this._log(`${code} buy executed!`, "success");
+        this._log(`${code}:T${tier} buy executed!`, "success");
         this._addTradeLog(code, "BUY", quantity, currentPrice, tradeAmount);
-        this._setCooldown(code);
+        this._setCooldown(code, tier);
         this._recordTradeInDB(code, "buy", quantity, currentPrice);
         this._recordRecentTrade(code, "BUY", currentPrice, tradeAmount);
 
-        // Move buy target down, keep sell target
-        const oldBuy = this.targets[code].buy;
-        this.targets[code].buy = currentPrice * (1 - settings.deviation / 100);
+        // After BUY: buy target ratchets down, sell stays anchored high
+        const oldBuy = this.targets[key].buy;
+        this.targets[key].buy = currentPrice * (1 - settings.deviation / 100);
         this._log(
-          `${code} buy target: $${oldBuy.toFixed(2)} → $${this.targets[code].buy.toFixed(2)} (sell stays $${this.targets[code].sell.toFixed(2)})`,
+          `${code}:T${tier} buy target: $${oldBuy.toFixed(2)} → $${this.targets[key].buy.toFixed(2)} (sell stays $${this.targets[key].sell.toFixed(2)})`,
           "info",
         );
       } else {
-        this._log(`${code} buy failed: ${result.error}`, "error");
+        this._log(`${code}:T${tier} buy failed: ${result.error}`, "error");
       }
     } catch (error: any) {
-      this._log(`${code} buy error: ${error.message}`, "error");
+      this._log(`${code}:T${tier} buy error: ${error.message}`, "error");
     }
   }
 
-  private async _executeSell(code: string, currentPrice: number, settings: TierSettings) {
+  private async _executeSell(key: string, code: string, tier: number, currentPrice: number, settings: TierSettings) {
     const asset = this._cachedAssets.find((a) => a.code === code);
     const assetBalance = asset?.balance ?? 0;
 
@@ -701,13 +769,13 @@ export class AutoTrader {
     const quantity = parseFloat(((sellPercent / 100) * assetBalance).toFixed(8));
 
     if (quantity <= 0) {
-      this._log(`Skipping ${code} sell — insufficient balance`, "error");
+      this._log(`Skipping ${code}:T${tier} sell — insufficient balance`, "error");
       return;
     }
 
     const sellValue = quantity * currentPrice;
     this._log(
-      `AUTO SELL: ${quantity} ${code} at $${currentPrice.toFixed(2)} (${sellPercent.toFixed(1)}% of holdings)`,
+      `AUTO SELL T${tier}: ${quantity} ${code} at $${currentPrice.toFixed(2)} (${sellPercent.toFixed(1)}% of holdings)`,
       "success",
     );
 
@@ -720,24 +788,26 @@ export class AutoTrader {
       });
 
       if (result.success) {
-        this._log(`${code} sell executed!`, "success");
+        this._log(`${code}:T${tier} sell executed!`, "success");
         this._addTradeLog(code, "SELL", quantity, currentPrice, sellValue);
-        this._setCooldown(code);
+        this._setCooldown(code, tier);
         this._recordTradeInDB(code, "sell", quantity, currentPrice);
         this._recordRecentTrade(code, "SELL", currentPrice, sellValue);
 
-        // Move sell target up, keep buy target
-        const oldSell = this.targets[code].sell;
-        this.targets[code].sell = currentPrice * (1 + settings.deviation / 100);
+        // After SELL: both bands reset fresh from current price
+        this.targets[key] = {
+          buy: currentPrice * (1 - settings.deviation / 100),
+          sell: currentPrice * (1 + settings.sellDeviation / 100),
+        };
         this._log(
-          `${code} sell target: $${oldSell.toFixed(2)} → $${this.targets[code].sell.toFixed(2)} (buy stays $${this.targets[code].buy.toFixed(2)})`,
+          `${code}:T${tier} targets reset: buy $${this.targets[key].buy.toFixed(2)}, sell $${this.targets[key].sell.toFixed(2)}`,
           "info",
         );
       } else {
-        this._log(`${code} sell failed: ${result.error}`, "error");
+        this._log(`${code}:T${tier} sell failed: ${result.error}`, "error");
       }
     } catch (error: any) {
-      this._log(`${code} sell error: ${error.message}`, "error");
+      this._log(`${code}:T${tier} sell error: ${error.message}`, "error");
     }
   }
 
@@ -868,30 +938,57 @@ export class AutoTrader {
 
   // ── Cooldown Management ─────────────────────────────────
 
-  private _setCooldown(coin: string) {
-    const expiresAt = Date.now() + COOLDOWN_HOURS * 60 * 60 * 1000;
-    this.cooldowns[coin] = expiresAt;
+  private _setCooldown(coin: string, tier: number) {
+    const s = this.getTierSettings(tier);
+    const ck = AutoTrader.compoundKey(coin, tier);
+    const expiresAt = Date.now() + s.cooldownHours * 60 * 60 * 1000;
+    this.cooldowns[ck] = expiresAt;
     this._saveCooldowns();
-    this._log(`${coin} on cooldown for ${COOLDOWN_HOURS}h`, "info");
+    this._log(`${coin}:T${tier} on cooldown for ${s.cooldownHours}h`, "info");
   }
 
-  _isOnCooldown(coin: string): boolean {
-    const cooldown = this.cooldowns[coin];
-    if (!cooldown) return false;
-    if (Date.now() >= cooldown) {
-      delete this.cooldowns[coin];
-      return false;
+  _isOnCooldown(coin: string, tier?: number): boolean {
+    if (tier !== undefined) {
+      const ck = AutoTrader.compoundKey(coin, tier);
+      const cooldown = this.cooldowns[ck];
+      if (!cooldown) return false;
+      if (Date.now() >= cooldown) {
+        delete this.cooldowns[ck];
+        return false;
+      }
+      return true;
     }
-    return true;
+    // Check if coin is on cooldown in ANY tier
+    for (let t = 1; t <= 3; t++) {
+      if (this._isOnCooldown(coin, t)) return true;
+    }
+    return false;
   }
 
-  getCooldownRemaining(coin: string): string {
-    const cooldown = this.cooldowns[coin];
-    if (!cooldown) return "0h";
-    const remaining = cooldown - Date.now();
-    if (remaining <= 0) return "0h";
-    const hours = Math.floor(remaining / (60 * 60 * 1000));
-    const minutes = Math.floor((remaining % (60 * 60 * 1000)) / (60 * 1000));
+  getCooldownRemaining(coin: string, tier?: number): string {
+    if (tier !== undefined) {
+      const ck = AutoTrader.compoundKey(coin, tier);
+      const cooldown = this.cooldowns[ck];
+      if (!cooldown) return "0h";
+      const remaining = cooldown - Date.now();
+      if (remaining <= 0) return "0h";
+      const hours = Math.floor(remaining / (60 * 60 * 1000));
+      const minutes = Math.floor((remaining % (60 * 60 * 1000)) / (60 * 1000));
+      return `${hours}h ${minutes}m`;
+    }
+    // Return the longest cooldown across all tiers
+    let maxRemaining = 0;
+    for (let t = 1; t <= 3; t++) {
+      const ck = AutoTrader.compoundKey(coin, t);
+      const cooldown = this.cooldowns[ck];
+      if (cooldown) {
+        const remaining = cooldown - Date.now();
+        if (remaining > maxRemaining) maxRemaining = remaining;
+      }
+    }
+    if (maxRemaining <= 0) return "0h";
+    const hours = Math.floor(maxRemaining / (60 * 60 * 1000));
+    const minutes = Math.floor((maxRemaining % (60 * 60 * 1000)) / (60 * 1000));
     return `${hours}h ${minutes}m`;
   }
 
@@ -990,8 +1087,12 @@ export class AutoTrader {
 
     const autoTiers: Record<string, any> = {};
     for (let t = 1; t <= 3; t++) {
+      const s = this.tierSettings[`tier${t}`];
       autoTiers[`tier${t}`] = {
-        ...this.tierSettings[`tier${t}`],
+        deviation: s.deviation,
+        sellDeviation: s.sellDeviation,
+        allocation: s.allocation,
+        cooldownHours: s.cooldownHours,
         name: TIER_CONFIG[t].name,
         active: this.tierActive[t],
       };
@@ -1051,21 +1152,22 @@ export class AutoTrader {
     return this._cachedUsdcBalance;
   }
 
-  /** Get estimated BUY order amount in USDC for a coin */
-  getEstimatedBuyAmount(code: string): number {
-    const settings = this.getSettings(code);
+  /** Get estimated BUY order amount in USDC for a coin in a specific tier */
+  getEstimatedBuyAmount(code: string, tier?: number): number {
+    const t = tier || (this.getTiersForCoin(code)[0] ?? 1);
+    const settings = this.getTierSettings(t);
     const usdc = this._cachedUsdcBalance;
     const amount = (settings.allocation / 100) * usdc;
-    // Respect reserve
     if (usdc - amount < MIN_USDC_RESERVE) {
       return Math.max(0, usdc - MIN_USDC_RESERVE);
     }
     return amount;
   }
 
-  /** Get estimated SELL order value in USD for a coin */
-  getEstimatedSellValue(code: string): number {
-    const settings = this.getSettings(code);
+  /** Get estimated SELL order value in USD for a coin in a specific tier */
+  getEstimatedSellValue(code: string, tier?: number): number {
+    const t = tier || (this.getTiersForCoin(code)[0] ?? 1);
+    const settings = this.getTierSettings(t);
     const asset = this._cachedAssets.find((a) => a.code === code);
     const balance = asset?.balance ?? 0;
     const price = this._cachedPrices[code] || 0;
