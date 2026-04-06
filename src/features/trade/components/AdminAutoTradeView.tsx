@@ -252,7 +252,7 @@ const AdminAutoTradeView = ({ prices, changes, adminWallet, onClose, autoTrader 
         {/* ── Tier Cards — horizontal scroll ── */}
         <div
           className="flex gap-3 overflow-x-auto pb-2 -mx-1 px-1 snap-x"
-          style={{ scrollbarWidth: "none" }}
+          style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.15) transparent" }}
         >
           {tiers.map((tier) => {
             const availableToAdd = getCoinsNotInTier(tier.num);
