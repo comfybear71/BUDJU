@@ -41,7 +41,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = -1002398835975
 
 # Trading constants (mirrors autoTrader.ts)
-COOLDOWN_HOURS = 24
+DEFAULT_COOLDOWN_HOURS = 24
 MIN_USDC_RESERVE = 100
 MIN_ORDER_USDC = 8  # Floor for any trade (Swyftx minimum is $7)
 SELL_RATIO = 0.833
@@ -234,12 +234,35 @@ def _tier_num(value):
 
 
 def _tier_settings(tier_assets, tier_num):
-    """Get deviation and allocation % for a tier."""
+    """Get deviation, sellDeviation, allocation, and cooldownHours for a tier."""
     cfg = tier_assets.get(f"tier{tier_num}", {})
+    dev = float(cfg.get("deviation", 5))
     return {
-        "deviation": float(cfg.get("deviation", 5)),
+        "deviation": dev,
+        "sellDeviation": float(cfg.get("sellDeviation", dev)),
         "allocation": float(cfg.get("allocation", 5)),
+        "cooldownHours": float(cfg.get("cooldownHours", DEFAULT_COOLDOWN_HOURS)),
     }
+
+
+def _compound_key(coin, tier_num):
+    """Build a compound key like 'BTC:1'."""
+    return f"{coin}:{tier_num}"
+
+
+def _parse_compound_key(key):
+    """Parse 'BTC:1' → (coin, tier_num) or None."""
+    idx = key.rfind(":")
+    if idx == -1:
+        return None
+    coin = key[:idx]
+    try:
+        tier = int(key[idx + 1:])
+    except ValueError:
+        return None
+    if tier < 1 or tier > 3:
+        return None
+    return (coin, tier)
 
 
 def _is_tier_active(tier_active, tier_num):
@@ -291,8 +314,21 @@ def run_auto_trade_check():
     cooldowns = state.get("autoCooldowns", {})
     trade_log = state.get("autoTradeLog", [])
 
-    active_coins = [c for c in targets if _is_tier_active(tier_active, _tier_num(tier_assignments.get(c)))]
-    log.append(f"Monitoring {len(active_coins)} coins: {', '.join(sorted(active_coins))}")
+    # Count active compound keys
+    active_keys = []
+    for key in targets:
+        parsed = _parse_compound_key(key)
+        if parsed:
+            coin, tier_num = parsed
+            if _is_tier_active(tier_active, tier_num):
+                active_keys.append(key)
+        else:
+            # Old format: plain coin key — check if its assigned tier is active
+            tier_num = _tier_num(tier_assignments.get(key))
+            if _is_tier_active(tier_active, tier_num):
+                active_keys.append(key)
+
+    log.append(f"Monitoring {len(active_keys)} coin-tier slots")
 
     # 2. Fetch prices from CoinGecko
     try:
@@ -300,7 +336,6 @@ def run_auto_trade_check():
         log.append(f"Prices: {len(prices)} coins fetched")
     except Exception as e:
         log.append(f"Price fetch error: {e}")
-        # Still save heartbeat so the cron doesn't lose ownership
         _save_heartbeat(auto_active, now_ms)
         return {"error": f"Price fetch failed: {e}", "log": log}
 
@@ -313,26 +348,37 @@ def run_auto_trade_check():
         _save_heartbeat(auto_active, now_ms)
         return {"error": f"Portfolio fetch failed: {e}", "log": log}
 
-    # 4. Check each coin's price targets
+    # 4. Check each compound key's price targets
     code_to_id = None  # Lazy-loaded only if a trade is needed
     trades_executed = []
 
-    for code in list(targets.keys()):
-        tgt = targets.get(code)
+    for key in list(targets.keys()):
+        tgt = targets.get(key)
         if not isinstance(tgt, dict):
             continue
 
-        # Skip if on cooldown
-        cooldown_expiry = cooldowns.get(code, 0)
+        # Parse compound key or fall back to old format
+        parsed = _parse_compound_key(key)
+        if parsed:
+            code, tier_num = parsed
+        else:
+            # Old format: plain coin key
+            code = key
+            tier_num = _tier_num(tier_assignments.get(code))
+
+        # Skip if on cooldown (check compound key, fall back to plain key)
+        cooldown_expiry = cooldowns.get(key, 0)
+        if not cooldown_expiry and not parsed:
+            cooldown_expiry = cooldowns.get(code, 0)
         if isinstance(cooldown_expiry, (int, float)) and cooldown_expiry > now_ms:
             remaining_h = (cooldown_expiry - now_ms) / 3_600_000
-            log.append(f"{code}: cooldown ({remaining_h:.1f}h left)")
+            log.append(f"{key}: cooldown ({remaining_h:.1f}h left)")
             continue
         elif cooldown_expiry and isinstance(cooldown_expiry, (int, float)) and cooldown_expiry <= now_ms:
-            del cooldowns[code]
+            if key in cooldowns:
+                del cooldowns[key]
 
         # Check tier is active
-        tier_num = _tier_num(tier_assignments.get(code))
         if not _is_tier_active(tier_active, tier_num):
             continue
 
@@ -353,11 +399,11 @@ def run_auto_trade_check():
             trade_amount = max(trade_amount, MIN_ORDER_USDC)
 
             if usdc_balance - trade_amount < MIN_USDC_RESERVE:
-                log.append(f"{code}: BUY signal but USDC ${usdc_balance:.2f} too low (need ${MIN_USDC_RESERVE} reserve)")
+                log.append(f"{key}: BUY signal but USDC ${usdc_balance:.2f} too low (need ${MIN_USDC_RESERVE} reserve)")
                 continue
 
             quantity = round(trade_amount / current_price, 8)
-            log.append(f"{code}: BUY at ${current_price:.2f} (target ${buy_target:.2f}) — ${trade_amount:.2f}")
+            log.append(f"{key}: BUY at ${current_price:.2f} (target ${buy_target:.2f}) — ${trade_amount:.2f}")
 
             if code_to_id is None:
                 code_to_id = fetch_swyftx_asset_ids()
@@ -365,14 +411,15 @@ def run_auto_trade_check():
             ok, order_id, err = place_market_order(code, "buy", trade_amount, code_to_id)
 
             if ok:
-                log.append(f"{code}: BUY executed (order {order_id})")
+                log.append(f"{key}: BUY executed (order {order_id})")
 
-                # Move buy target down, sell stays
-                targets[code]["buy"] = current_price * (1 - settings["deviation"] / 100)
-                log.append(f"{code}: new buy target ${targets[code]['buy']:.2f}")
+                # After BUY: buy target ratchets down, sell stays anchored high
+                targets[key]["buy"] = current_price * (1 - settings["deviation"] / 100)
+                log.append(f"{key}: new buy target ${targets[key]['buy']:.2f}")
 
-                # Set cooldown
-                cooldowns[code] = now_ms + COOLDOWN_HOURS * 3_600_000
+                # Set cooldown using per-tier cooldownHours
+                cd_hours = settings["cooldownHours"]
+                cooldowns[key] = now_ms + int(cd_hours * 3_600_000)
 
                 # Trade log
                 trade_log.insert(0, {
@@ -391,7 +438,7 @@ def run_auto_trade_check():
                     log.append(f"DB record error: {e}")
 
                 trades_executed.append({
-                    "coin": code, "side": "BUY",
+                    "coin": code, "tier": tier_num, "side": "BUY",
                     "amount": round(trade_amount, 2),
                     "price": round(current_price, 2),
                 })
@@ -399,13 +446,13 @@ def run_auto_trade_check():
                 usdc_balance -= trade_amount
 
                 send_telegram(
-                    f"🤖 <b>Auto BUY</b>\n"
+                    f"🤖 <b>Auto BUY T{tier_num}</b>\n"
                     f"💰 {quantity:.6f} {code} @ ${current_price:,.2f}\n"
                     f"📦 ${trade_amount:,.2f} USDC\n"
                     f"🆔 {order_id}"
                 )
             else:
-                log.append(f"{code}: BUY failed — {err}")
+                log.append(f"{key}: BUY failed — {err}")
 
         # ── SELL: price rose above sell target ──
         elif current_price >= sell_target:
@@ -414,7 +461,7 @@ def run_auto_trade_check():
             quantity = round((sell_pct / 100) * asset_balance, 8)
 
             if quantity <= 0:
-                log.append(f"{code}: SELL signal but no balance")
+                log.append(f"{key}: SELL signal but no balance")
                 continue
 
             sell_value = quantity * current_price
@@ -426,14 +473,13 @@ def run_auto_trade_check():
                     quantity = round(min_qty, 8)
                     sell_value = quantity * current_price
                 else:
-                    # Sell entire balance if it meets minimum
                     quantity = round(asset_balance, 8)
                     sell_value = quantity * current_price
                     if sell_value < MIN_ORDER_USDC:
-                        log.append(f"{code}: SELL signal but total holding (${sell_value:.2f}) below ${MIN_ORDER_USDC} minimum")
+                        log.append(f"{key}: SELL signal but total holding (${sell_value:.2f}) below ${MIN_ORDER_USDC} minimum")
                         continue
 
-            log.append(f"{code}: SELL at ${current_price:.2f} (target ${sell_target:.2f}) — {quantity:.8f} (${sell_value:.2f})")
+            log.append(f"{key}: SELL at ${current_price:.2f} (target ${sell_target:.2f}) — {quantity:.8f} (${sell_value:.2f})")
 
             if code_to_id is None:
                 code_to_id = fetch_swyftx_asset_ids()
@@ -441,14 +487,16 @@ def run_auto_trade_check():
             ok, order_id, err = place_market_order(code, "sell", sell_value, code_to_id)
 
             if ok:
-                log.append(f"{code}: SELL executed (order {order_id})")
+                log.append(f"{key}: SELL executed (order {order_id})")
 
-                # Move sell target up, buy stays
-                targets[code]["sell"] = current_price * (1 + settings["deviation"] / 100)
-                log.append(f"{code}: new sell target ${targets[code]['sell']:.2f}")
+                # After SELL: both bands reset fresh from current price
+                targets[key]["buy"] = current_price * (1 - settings["deviation"] / 100)
+                targets[key]["sell"] = current_price * (1 + settings["sellDeviation"] / 100)
+                log.append(f"{key}: targets reset — buy ${targets[key]['buy']:.2f}, sell ${targets[key]['sell']:.2f}")
 
-                # Set cooldown
-                cooldowns[code] = now_ms + COOLDOWN_HOURS * 3_600_000
+                # Set cooldown using per-tier cooldownHours
+                cd_hours = settings["cooldownHours"]
+                cooldowns[key] = now_ms + int(cd_hours * 3_600_000)
 
                 # Trade log
                 trade_log.insert(0, {
@@ -467,24 +515,24 @@ def run_auto_trade_check():
                     log.append(f"DB record error: {e}")
 
                 trades_executed.append({
-                    "coin": code, "side": "SELL",
+                    "coin": code, "tier": tier_num, "side": "SELL",
                     "amount": round(sell_value, 2),
                     "price": round(current_price, 2),
                 })
 
                 send_telegram(
-                    f"🤖 <b>Auto SELL</b>\n"
+                    f"🤖 <b>Auto SELL T{tier_num}</b>\n"
                     f"💸 {quantity:.6f} {code} @ ${current_price:,.2f}\n"
                     f"📦 ${sell_value:,.2f} USDC\n"
                     f"🆔 {order_id}"
                 )
             else:
-                log.append(f"{code}: SELL failed — {err}")
+                log.append(f"{key}: SELL failed — {err}")
 
         # ── No trigger ──
         else:
             log.append(
-                f"{code}: ${current_price:.2f} — "
+                f"{key}: ${current_price:.2f} — "
                 f"{pct_to_buy:.1f}% to buy (${buy_target:.2f}), "
                 f"{pct_to_sell:.1f}% to sell (${sell_target:.2f})"
             )
@@ -505,7 +553,7 @@ def run_auto_trade_check():
     return {
         "tradesExecuted": len(trades_executed),
         "trades": trades_executed,
-        "coinsMonitored": len(active_coins),
+        "slotsMonitored": len(active_keys),
         "log": log,
     }
 
